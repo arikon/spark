@@ -348,6 +348,13 @@ function start() {
         });
     }
 
+    // Remove unix socket file after process exit
+    if (env.socket) {
+        process.on('exit', function() {
+            fs.unlinkSync(env.socket);
+        });
+    }
+
     // Spawn worker processes
     if (workers) {
         if (process.version < '0.1.98' && process.version > "0.1.199") {
@@ -370,13 +377,13 @@ function start() {
         for (var i = 0; i < workers; i++) {
             // Create an unnamed unix socket to pass the fd to the child.
             var fds = netBinding.socketpair();
-            
+
             // Collect the child process arguments
             var args = [__filename, '--child'];
             if (comment) {
                 args.push('--comment', comment);
             }
-            
+
             // Spawn the child process
             var child = children[i] = child_process.spawn(
                 process.argv[0],
@@ -427,6 +434,13 @@ function start() {
     }
 
     changeUser();
+
+    // Gracefully exit on signals
+    ['SIGINT', 'SIGHUP', 'SIGTERM'].forEach(function(signal) {
+        process.addListener(signal, function() {
+            process.exit();
+        });
+    });
 }
 
 /**
