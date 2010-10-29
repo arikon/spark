@@ -13,6 +13,7 @@
 var child_process = require('child_process'),
     netBinding = process.binding('net'),
     dirname = require('path').dirname,
+    basename = require('path').basename,
     exists = require('path').existsSync,
     resolve = require('url').resolve,
     http = require('http'),
@@ -34,10 +35,10 @@ var version = '0.2.1';
 var comment;
 
 /**
- * Use child process workers to utilize all cores
+ * Use child process workers to utilize all cores.
  */
 
-var workers;
+var workers = 5;
 
 /**
  * Verbose output.
@@ -66,7 +67,7 @@ var env = process.sparkEnv = {
  */
 
 var usage = ''
-    + '[bold]{Usage}: spark [options]\n'
+    + '[bold]{Usage}: ' + basename(__filename) + ' [options] [appPath]\n'
     + '\n'
     + '[bold]{Options}:\n'
     + '  --comment            Ignored, this is to label the process in htop\n'
@@ -76,7 +77,7 @@ var usage = ''
     + '  -p, --port NUM       Port number, defaults to 3000\n'
     + '  --ssl-key PATH       SSL key file\n'
     + '  --ssl-crt PATH       SSL certificate file\n'
-    + '  -n, --workers NUM    Number of worker processes to spawn\n'
+    + '  -n, --workers NUM    Number of worker processes to spawn, defaults to 5\n'
     + '  -I, --include PATH   Unshift the given path to require.paths\n'
     + '  -E, --env NAME       Set environment, defaults to "development"\n'
     + '  -M, --mode NAME      Alias of -E, --env\n'
@@ -91,6 +92,118 @@ var usage = ''
     + '  -h, --help           Outputy help information\n'
     + '  --ENV VAL            Sets the given spark environment variable\n'
     ;
+
+function Worker(options) {
+    // Create an unnamed unix socket to pass the fd to the worker
+    var fds = netBinding.socketpair(),
+        args = [__filename, '--child'],
+        self = this;
+
+    if (options.comment) {
+        args.push('--comment', options.comment);
+    }
+
+    // Spawn the worker process
+    this.process = child_process.spawn(
+        process.argv[0],
+        args,
+        process.cwd,
+        [fds[1], 1, 2]
+    );
+
+    // Save pid
+    this.pid = this.process.pid;
+
+    log('worker spawned [bold]{' + this.process.pid + '}');
+
+    // For some reason stdin isn't getting set, patch it externally
+    if (!this.process.stdin) {
+        this.process.stdin = new net.Stream(fds[0], 'unix');
+    }
+
+    // Pass fd to the worker
+    this.process.stdin.write(JSON.stringify(env), 'ascii', options.fd);
+
+    this.on('exit', function (code) {
+        log('worker process [bold]{' + self.getId() + '} exited with code [bold]{' + code + '}');
+    });
+}
+
+Worker.prototype.on = function(signal, callback) {
+    this.process.on(signal, callback);
+}
+
+Worker.prototype.getId = function() {
+    return this.pid;
+}
+
+Worker.prototype.kill = function(signal) {
+    this.process.kill(signal);
+}
+
+function WorkerPool(options) {
+    options = options ? options : {};
+    this.options = {
+        fd: options.fd,
+        workers: parseInt(options.workers) || 4,
+        comment: options.comment
+    };
+    this.workers = {};
+    this.listeners = {};
+    this.checkWorkers();
+}
+
+WorkerPool.prototype.checkWorkers = function() {
+    while (Object.keys(this.workers).length < this.options.workers) {
+        this.addWorker();
+    }
+}
+
+WorkerPool.prototype.addWorker = function() {
+    if (Object.keys(this.workers).length > this.options.workers) return;
+
+    var worker = new Worker(this.options);
+
+    // attach on exit reaction to worker
+    var self = this;
+    worker.on('exit', function(code) {
+        delete self.workers[worker.getId()];
+        if (code == 0) return;
+        self.checkWorkers();
+    });
+
+    // attach signals listener to just created worker
+    for (var signal in this.listeners) {
+        for (var i = 0; i < this.listeners[signal]; i++) {
+            worker.on(signal, this.listeners[signal][0]);
+        }
+    }
+    this.workers[worker.getId()] = worker;
+}
+
+WorkerPool.prototype.on = function(signal, callback) {
+    if (! this.listeners[signal] instanceof Array) {
+        this.listeners[signal] = [];
+    }
+    this.listeners[signal].push(callback);
+    for (var id in this.workers) {
+        this.workers[id].on(signal, callback);
+    }
+}
+
+WorkerPool.prototype.kill = function(signal, ignoreErrors) {
+    for (var id in this.workers) {
+        if (ignoreErrors) {
+            try {
+                this.workers[id].kill(signal);
+            } catch (err) {
+                // Ignore
+            }
+            continue;
+        }
+        this.workers[id].kill(signal);
+    }
+}
 
 /**
  * Log the given msg to stderr.
@@ -114,7 +227,7 @@ function colorize(str) {
     var colors = useColors
         ? { bold: 1 }
         : {};
-    return str.replace(/\[(\w+)\]\{([^}]+)\}/g, function(_, color, str){
+    return str.replace(/\[(\w+)\]\{([^}]+)\}/g, function(_, color, str) {
         return '\x1B[' + colors[color] + 'm' + str +'\x1B[0m';
     });
 }
@@ -159,7 +272,7 @@ function mkdirs(path, mode) {
  * @return {String}
  */
 
-function modulePath(path){
+function modulePath(path) {
     return path.replace(/\.js$/, '');
 }
 
@@ -195,7 +308,7 @@ function loadConfig(file) {
         var key = '--' + key;
 
         // Apply flags
-        val.forEach(function(val){
+        val.forEach(function(val) {
             log('  ' + key + ' ' + (val === true ? '' : sys.inspect(val)));
             args.push(key);
             if (typeof val !== 'boolean') {
@@ -214,7 +327,7 @@ function loadConfig(file) {
  */
 
 function absPath(path) {
-	return resolve(process.cwd() + '/', path);
+    return resolve(process.cwd() + '/', path);
 }
 
 /**
@@ -265,7 +378,7 @@ function getAppPath() {
             log('detected server.js');
             path += 'server';
         } else {
-            abort('app not found, pass a module path, or create {app,server}.js');
+            abort('App not found, pass a module path, or create {app,server}.js in current directory\n\n' + usage);
         }
     }
 
@@ -304,12 +417,12 @@ function changeUser() {
  */
 
 function startWorker() {
-    var stdin = new net.Stream(0, 'unix');
-    stdin.addListener('data', function(json){
+    var stdin = new net.Stream(0, 'unix'),
+        app = requireApp(getAppPath());
+    stdin.on('data', function (json) {
         process.sparkEnv = env = JSON.parse(json.toString());
     });
-    stdin.addListener('fd', function(fd){
-        var app = requireApp(getAppPath());
+    stdin.on('fd', function(fd) {
         sys.error('Spark server(' + process.pid + ') listening on '
             + (env.socket ? 'unix socket ' + env.socket : 'http' + (env.sslKey ? 's' : '') + '://' + (env.host || '*') + ':' + env.port)
             + ' in ' + env.name + ' mode');
@@ -318,6 +431,11 @@ function startWorker() {
     });
     stdin.resume();
 
+    ['SIGINT', 'SIGHUP', 'SIGTERM'].forEach(function(signal) {
+        process.on(signal, function() {
+            process.exit();
+        });
+    });
 }
 
 /**
@@ -325,7 +443,14 @@ function startWorker() {
  */
 
 function start() {
+    if (process.version < '0.1.98' && process.version > '0.1.199') {
+        abort('Cannot use workers with Node.JS older than v0.1.98');
+    }
+
     log('starting');
+
+    // Change process uid and gid
+    changeUser();
 
     // Detect config.js
     if (exists('./config.js')) {
@@ -348,98 +473,39 @@ function start() {
         });
     }
 
-    // Remove unix socket file after process exit
+    // Open socket (net or unix)
     if (env.socket) {
+        var fd = netBinding.socket('unix');
+        netBinding.bind(fd, env.socket);
+
+        // Remove unix socket file after process exit
         process.on('exit', function() {
             fs.unlinkSync(env.socket);
         });
-    }
-
-    // Spawn worker processes
-    if (workers) {
-        if (process.version < '0.1.98' && process.version > "0.1.199") {
-            abort('Cannot use workers with a version older than v0.1.98');
-        }
-
-        if (env.socket) {
-            var fd = netBinding.socket('unix');
-            netBinding.bind(fd, env.socket);
-        } else {
-            var afNum = (netBinding.isIP(env.host) == 6) ? 6 : 4;
-            var fd = netBinding.socket('tcp' + afNum);
-            netBinding.bind(fd, env.port, env.host);
-        }
-        netBinding.listen(fd, 128);
-
-        changeUser();
-        var children = [];
-
-        for (var i = 0; i < workers; i++) {
-            // Create an unnamed unix socket to pass the fd to the child.
-            var fds = netBinding.socketpair();
-
-            // Collect the child process arguments
-            var args = [__filename, '--child'];
-            if (comment) {
-                args.push('--comment', comment);
-            }
-
-            // Spawn the child process
-            var child = children[i] = child_process.spawn(
-                process.argv[0],
-                args,
-                undefined,
-                [fds[1], 1, 2]
-            );
-            log('child spawned [bold]{' + child.pid + '}');
-
-            // For some reason stdin isn't getting set, patch it externally
-            if (!child.stdin) {
-                child.stdin = new net.Stream(fds[0], 'unix');
-            }
-
-            child.stdin.write(JSON.stringify(env), 'ascii', fd);
-
-        }
-
-        changeUser();
-
-        // Forward signals to child processes, keeps the zombies at bay.
-        ['SIGINT', 'SIGHUP', 'SIGTERM'].forEach(function(signal){
-            process.addListener(signal, function(){
-                children.forEach(function(child){
-                    try {
-                        child.kill(signal);
-                    } catch (err) {
-                        // Ignore
-                    }
-                });
-                process.exit();
-            });
-        });
-
-        return;
-    }
-
-    // Load the app module
-    var app = requireApp(path);
-    sys.error('Spark server(' + process.pid + ') listening on '
-        + (env.socket ? 'unix socket ' + env.socket : 'http' + (env.sslKey ? 's' : '') + '://' + (env.host || '*') + ':' + env.port)
-        + ' in ' + env.name + ' mode');
-    enableSSL(app, env);
-    if (env.socket) {
-        app.listen(env.socket);
     } else {
-        app.listen(env.port, env.host);
+        var afNum = (netBinding.isIP(env.host) == 6) ? 6 : 4;
+        var fd = netBinding.socket('tcp' + afNum);
+        netBinding.bind(fd, env.port, env.host);
     }
+    netBinding.listen(fd, 128);
 
-    changeUser();
+    // Initialize worker processes pool
+    var pool = new WorkerPool({
+        fd: fd,
+        workers: workers,
+        comment: comment
+    });
 
-    // Gracefully exit on signals
+    // Forward signals to child processes, keeps the zombies at bay.
     ['SIGINT', 'SIGHUP', 'SIGTERM'].forEach(function(signal) {
-        process.addListener(signal, function() {
-            process.exit();
+        process.on(signal, function() {
+            pool.kill(signal, true);
         });
+    });
+
+    // Kill workers on process exit
+    process.on('exit', function() {
+        pool.kill('SIGTERM', true);
     });
 }
 
@@ -560,7 +626,6 @@ function parseArguments(args, cmd) {
     }
 
     // Run the command
-
     switch (cmd) {
         case 'worker':
             startWorker();
