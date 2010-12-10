@@ -201,7 +201,6 @@ function loadConfig(file) {
         });
     }
     parseArguments(args);
-    parseArguments(process.argv.slice(2));
 }
 
 
