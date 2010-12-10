@@ -679,6 +679,9 @@ function parseArguments(args, cmd) {
             case '--ssl-crt':
                 env.sslCrt = fs.readFileSync(requireArg('--ssl-crt'), 'ascii');
                 break;
+            case '--app':
+                env.appPath = modulePath(requireArg('--app'));
+                break;
             default:
                 if (arg[0] === '-') {
                     arg = arg.substr(2);
